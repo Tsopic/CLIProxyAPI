@@ -31,6 +31,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.POST("/requests/api-call", s.mgmt.APICall)
 	v8.GET("/quotas/claude", s.mgmt.GetCachedClaudeQuota)
 	v8.GET("/quotas/claude/credentials", s.mgmt.GetClaudeQuotaCredentials)
+	v8.GET("/quotas/claude/health", s.mgmt.GetClaudeQuotaHealth)
 	v8.POST("/routing/cooldown/reset", s.mgmt.ResetQuota)
 	v8.GET("/routing/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 	v8.POST("/routing/model-definitions/refresh", s.mgmt.RefreshModelDefinitions)

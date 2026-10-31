@@ -65,7 +65,7 @@ lock cleanup are needed. The empty lock file persists: **never delete or rotate
 it while collectors may run**, because doing so would allow different processes
 to lock different inodes. Missing `flock` or lock acquisition failure aborts the
 run without publishing. Previous state is read under the same lock, bounded to
-2 MiB and validated before reuse; malformed or oversized state is discarded.
+1 MiB and validated before reuse; malformed or oversized state is discarded.
 Failure to list credentials preserves the preceding snapshot. Individual usage
 failures publish durable retry state even when no usable observations exist;
 publication alone does not imply quota recovery. Consumers must reject stale
@@ -77,7 +77,9 @@ ineligible. Legacy model windows and expanded `limits` entries with
 `scope.model.id` or `scope.model.display_name` block the recognized model
 family (Opus, Sonnet, Fable, Haiku, or Mythos). Exhausted or locked unknown scopes
 make the account ineligible, while malformed windows fail that observation. An
-inactive window with no reset uses the existing far-future reset sentinel.
+explicit upstream `five_hour: null` becomes `{ "utilization": 0, "resets_at": null }`
+only when `seven_day` is valid. Missing shared windows and a null weekly window
+remain invalid. An inactive window with no reset uses the existing far-future reset sentinel.
 
 ## Validation
 
@@ -118,14 +120,93 @@ and per-account retry state. Both routing and cached reads enforce the binding.
 Neither endpoint returns a token. The collector uses native
 `POST /v8/management/requests/api-call` for usage observations.
 
-Install the collector outside the temporary worktree. `collector.service` and
-`collector.timer` are user-systemd templates: replace `@NODE@` with the installed
-Node executable and install them as `cliproxy-claude-quota.service` and
-`cliproxy-claude-quota.timer`. Copy `snapshot.mjs` to
-`~/.local/share/cliproxyapi-quota/`, start the service once, then enable the timer.
-The timer may continue invoking it every 30 seconds: the persisted scheduler
-skips usage requests before the five-minute refresh or retry deadlines. Such
-skips are successful runs, not collection failures. Only fresh available account
-observations establish recovery; preserved exhausted or expired cache does not.
-Back up the binary and proxy configuration before deploying a native build.
-Rollback restores those two files and restarts `cliproxyapi.service`.
+Install maintained copies outside the checkout with the reproducible installer:
+
+```sh
+node tools/claude-quota/install.mjs
+```
+
+It atomically replaces `~/.local/share/cliproxyapi-quota/snapshot.mjs` and the
+four collector/health user-systemd units in `~/.config/systemd/user/`, substitutes
+the current absolute Node executable, reloads systemd, and enables both timers.
+Rerun after upgrades, before deleting a temporary checkout. It preserves
+`quota.json`, its lock file, and the existing management key. No secrets are
+included or created. The key must already exist at
+`~/.config/cliproxyapi/management-key`; the native proxy must listen at
+`http://127.0.0.1:8317`. Use `--no-enable` to install files without calling
+systemd. The collector timer invokes every 30 seconds; per-account refresh
+remains five minutes, and persisted retry deadlines continue to apply.
+
+## Collector health
+
+Both ordinary collection and the read-only check print a single JSON aggregate:
+
+```sh
+CLAUDE_QUOTA_SNAPSHOT="$HOME/.local/share/cliproxyapi-quota/quota.json" \
+node "$HOME/.local/share/cliproxyapi-quota/snapshot.mjs" --health
+```
+
+`--health` reads only the bounded snapshot: it does not read credentials, acquire
+the collection lock, or make network requests. Atomic publication gives it either
+the preceding or current complete snapshot. It recomputes age at read time so a
+stopped collector cannot continue reporting its last published healthy status.
+It cannot verify the current credential inventory without the proxy; collection
+prunes and rebinds observations against that inventory on every run.
+
+Snapshots include aggregate `health` and per-account `account_health` keyed by
+the existing credential IDs. The aggregate contains `status`, `checked_at`,
+`total`, `fresh`, `warning`, `stale`, `missing`, `failing`, `backoff`, `errors`,
+`collector_freshness`, and, when available, `oldest_observation_at`. Counts may
+overlap: a fresh last-good observation can have an active failure and backoff.
+Per-account health contains `status`, `freshness`, `backoff`, and applicable
+`last_success_at`, `last_attempt_at`, `next_attempt_at`, and `last_error`.
+
+A failed attempt immediately degrades collector health, even while the last-good
+observation remains fresh. Age reaches warning at 10 minutes and stale at 30
+minutes, matching the routing maximum. Missing observations are stale. The
+snapshot publication heartbeat uses the same thresholds; an empty enabled
+inventory is degraded. Global backoff degrades all affected accounts, including
+those not queried after a 429. Published health and skipped or failed runs never
+advance account observation timestamps. Exhausted but valid, fresh quota is
+healthy collection: eligibility and collector health are independent.
+
+`retry_state.last_error` is restricted to `transport`, `management_http`,
+`wrapper_parse`, `wrapper_schema`, `upstream_http`, `usage_parse`, and
+`usage_schema`; `last_attempt_at` records the failed request start. These values
+survive backoff and clear on success. `health.errors` counts those categories.
+Bodies, exception text, tokens, account names, identifiers, and fingerprints
+never enter terminal summaries. The snapshot retains the existing credential
+binding fields and IDs for routing and is installed with private permissions.
+
+Both modes exit 0 only when healthy, and exit 1 for degraded, stale, unreadable,
+or invalid state. Collection publishes retry state before returning a nonzero
+health result. Credential-list or publication failures preserve the preceding
+snapshot and print the fixed `collection_failed` error; failed read-only checks
+print `snapshot_unavailable`. The health timer runs once per minute independently
+of collection. A degraded check marks `cliproxy-claude-quota-health.service`
+failed and writes the sanitized aggregate to the journal:
+
+```sh
+systemctl --user status cliproxy-claude-quota-health.service
+journalctl --user -u cliproxy-claude-quota-health.service
+```
+
+Tests additionally cover explicit inactive upstream windows, failure categories,
+warning and expiry boundaries, read-only CLI behavior and privacy, durable retry
+state before a failing CLI exit, and upgrade-safe installation in an isolated
+home directory. No tests call live endpoints or use real credentials.
+
+The authenticated `GET /v8/management/quotas/claude/health` endpoint recomputes
+health against the proxy's current enabled Claude OAuth credentials and their
+fingerprints. It returns HTTP 200 for healthy collection and HTTP 503 for
+degraded or stale collection, with aggregate counts and allowlisted error
+categories only. Exhausted subscriptions with current observations are healthy
+collection. Routing continues to enforce quota and cache freshness; its existing
+`claude_quota_unavailable` code now includes a safe `reason` distinguishing
+collector refresh failure, expired observations, and an unavailable snapshot.
+
+The collector unit disables systemd's overall start deadline: each credential
+request already has a deadline, but total duration grows with inventory size.
+A fixed service deadline could discard successful observations and backoff before
+atomic publication. The independent health timer continues checking freshness
+while collection is running or waiting for its lock.

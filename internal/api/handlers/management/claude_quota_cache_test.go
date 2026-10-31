@@ -88,3 +88,37 @@ func TestCachedClaudeQuotaNeverRefreshesUpstream(testContext *testing.T) {
 		testContext.Fatalf("expired cache status=%d", recorder.Code)
 	}
 }
+
+func TestClaudeQuotaHealthEndpointDistinguishesCollectionFailure(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	credential, err := manager.Register(context.Background(), &coreauth.Auth{ID: "private-email@example.test", Provider: "claude", Metadata: map[string]any{"access_token": "synthetic-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "quota.json")
+	handler := &Handler{cfg: &config.Config{Routing: config.RoutingConfig{ClaudeQuotaSnapshot: path}}, authManager: manager}
+	router := gin.New()
+	router.GET("/health", handler.GetClaudeQuotaHealth)
+	for _, age := range []time.Duration{time.Minute, 11 * time.Minute, 31 * time.Minute} {
+		raw, _ := json.Marshal(map[string]any{"observed_at": time.Now().UTC(), "accounts": map[string]any{credential.ID: map[string]any{
+			"observed_at": time.Now().UTC().Add(-age), "auth_index": credential.Index, "credential_fingerprint": coreauth.AccessTokenSHA256(credential), "eligible": false, "usage": map[string]any{"seven_day": map[string]any{"utilization": 100}},
+		}}})
+		if err := os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health", nil))
+		expected := http.StatusOK
+		if age >= 10*time.Minute {
+			expected = http.StatusServiceUnavailable
+		}
+		if response.Code != expected || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		for _, secret := range []string{credential.ID, credential.Index, coreauth.AccessTokenSHA256(credential), "synthetic-token"} {
+			if strings.Contains(response.Body.String(), secret) {
+				t.Fatal("private credential identity exposed")
+			}
+		}
+	}
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check CLIProxyAPI Claude quota collector health
+
+[Service]
+Type=oneshot
+ExecStart=@NODE@ "%h/.local/share/cliproxyapi-quota/snapshot.mjs" --health
+Environment="CLAUDE_QUOTA_SNAPSHOT=%h/.local/share/cliproxyapi-quota/quota.json"
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=15

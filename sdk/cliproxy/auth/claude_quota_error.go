@@ -17,6 +17,7 @@ type ClaudeQuotaErrorMetadata struct {
 	ResetAt           *time.Time `json:"reset_at,omitempty"`
 	NextCheckAt       *time.Time `json:"next_check_at,omitempty"`
 	RetryAfterSeconds int64      `json:"retry_after_seconds,omitempty"`
+	Reason            string     `json:"reason,omitempty"`
 }
 
 // ClaudeQuotaError preserves the auth Error layout and exposes only locally

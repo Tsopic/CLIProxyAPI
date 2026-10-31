@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { collectAndPublish, collectSnapshot, normalizeUsage, retryAfterMS, sanitizeUsage } from './snapshot.mjs';
+import { collectAndPublish, collectSnapshot, normalizeUsage, retryAfterMS, sanitizeUsage, snapshotHealth, readHealth } from './snapshot.mjs';
 
 const window = (utilization, resets_at = '2026-11-03T07:00:00Z') => ({ utilization, resets_at });
 const usage = () => ({ five_hour: window(0, null), seven_day: window(0), seven_day_opus: null, seven_day_sonnet: null });
@@ -320,4 +320,166 @@ test('publication persists failed retries and serialized runs re-read their sche
   await writeFile(path, 'x'.repeat(2 * 1024 * 1024 + 1));
   await collectAndPublish(path, 'http://synthetic', 'synthetic-key', options);
   assert.equal(calls, 2);
+});
+
+
+const inactiveFiveHour = JSON.parse(await readFile(new URL('./fixtures/inactive-five-hour.json', import.meta.url), 'utf8'));
+
+test('explicit inactive five-hour fixture normalizes without accepting missing or malformed shared windows', async () => {
+  const safe = sanitizeUsage(inactiveFiveHour);
+  assert.deepEqual(safe.five_hour, { utilization: 0, resets_at: null });
+  assert.equal(normalizeUsage(inactiveFiveHour).eligible, true);
+  const snapshot = await runner([credential('a')], () => Response.json({ status_code: 200, body: JSON.stringify(inactiveFiveHour) }), epoch);
+  assert.deepEqual(snapshot.accounts.a.usage.five_hour, safe.five_hour);
+  assert.equal(snapshot.health.status, 'healthy');
+  for (const input of [
+    { seven_day: window(0) }, { five_hour: undefined, seven_day: window(0) },
+    { five_hour: null }, { five_hour: null, seven_day: null },
+    { five_hour: null, seven_day: {} }, { five_hour: null, seven_day: window(20, null) },
+    { five_hour: [], seven_day: window(0) },
+  ]) assert.throws(() => sanitizeUsage(input));
+});
+
+test('failure reasons are sanitized, persisted and cleared independently of quota eligibility', async () => {
+  const files = [credential('a')];
+  const initial = await runner(files, successful, epoch);
+  const cases = [
+    ['transport', () => { throw new Error('synthetic-secret'); }],
+    ['management_http', () => new Response('synthetic-secret', { status: 503 })],
+    ['wrapper_parse', () => new Response('synthetic-secret')],
+    ['wrapper_schema', () => Response.json({ status_code: 'synthetic-secret' })],
+    ['wrapper_schema', () => Response.json({ status_code: 200, body: {} })],
+    ['upstream_http', broken],
+    ['usage_parse', () => Response.json({ status_code: 200, body: 'synthetic-secret' })],
+    ['usage_schema', () => Response.json({ status_code: 200, body: JSON.stringify({ five_hour: null }) })],
+  ];
+  for (const [kind, handler] of cases) {
+    const failed = await runner(files, handler, epoch + 300_000, initial);
+    assert.equal(failed.retry_state.a.last_error, kind);
+    assert.equal(failed.retry_state.a.last_attempt_at, new Date(epoch + 300_000).toISOString());
+    assert.deepEqual(failed.accounts.a, initial.accounts.a);
+    assert.equal(failed.health.status, 'degraded');
+    assert.equal(failed.health.errors[kind], 1);
+    assert.equal(failed.account_health.a.last_error, kind);
+    assert.equal(failed.account_health.a.backoff, true);
+    assert.equal(JSON.stringify(failed).includes('synthetic-secret'), false);
+    const skipped = await runner(files, () => assert.fail('backoff should skip request'), epoch + 310_000, failed);
+    assert.equal(skipped.account_health.a.last_error, kind);
+    const recovered = await runner(files, successful, epoch + 360_000, skipped);
+    assert.equal(recovered.account_health.a.last_error, undefined);
+    assert.equal(recovered.health.status, 'healthy');
+  }
+  const exhausted = usage(); exhausted.seven_day = window(100);
+  const snapshot = await runner(files, () => Response.json({ status_code: 200, body: JSON.stringify(exhausted) }), epoch);
+  assert.equal(snapshot.accounts.a.eligible, false);
+  assert.equal(snapshot.health.status, 'healthy');
+});
+
+test('health warns before expiry, detects stale heartbeat and never refreshes last-good timestamps', async () => {
+  const initial = await runner([credential('a')], successful, epoch);
+  assert.equal(snapshotHealth(initial, epoch + 599_999).health.status, 'healthy');
+  const warning = snapshotHealth(initial, epoch + 600_000);
+  assert.equal(warning.health.status, 'degraded');
+  assert.equal(warning.health.warning, 1);
+  assert.equal(warning.health.collector_freshness, 'warning');
+  assert.equal(warning.account_health.a.last_success_at, initial.accounts.a.observed_at);
+  const stale = snapshotHealth(initial, epoch + 1_800_000);
+  assert.equal(stale.health.status, 'stale');
+  assert.equal(stale.health.stale, 1);
+  // Even a forged fresh observation cannot hide a collector that stopped publishing.
+  const staleHeartbeat = structuredClone(initial);
+  staleHeartbeat.accounts.a.observed_at = new Date(epoch + 1_800_000).toISOString();
+  assert.equal(snapshotHealth(staleHeartbeat, epoch + 1_800_000).health.status, 'stale');
+  const missing = await runner([credential('a')], broken, epoch);
+  assert.equal(missing.health.missing, 1);
+  assert.equal(missing.health.status, 'stale');
+  assert.equal((await runner([], successful, epoch)).health.status, 'degraded');
+});
+
+test('global backoff degrades unqueried accounts and hostile saved reasons are discarded', async () => {
+  const files = ['a', 'b'].map(credential);
+  const initial = await runner(files, successful, epoch);
+  const failed = await runner(files, () => Response.json({ status_code: 429, header: { 'retry-after': '1200' }, body: 'synthetic-secret' }), epoch + 300_000, initial);
+  assert.equal(failed.health.backoff, 2);
+  assert.equal(failed.account_health.b.status, 'degraded');
+  assert.equal(failed.account_health.b.next_attempt_at, failed.global_retry_at);
+  failed.retry_state.a.last_error = 'synthetic-secret';
+  failed.retry_state.a.last_attempt_at = 'synthetic-secret';
+  const checked = snapshotHealth(failed, epoch + 300_001);
+  assert.equal(checked.account_health.a.last_error, undefined);
+  assert.equal(JSON.stringify(checked).includes('synthetic-secret'), false);
+});
+
+test('read-only health CLI requires no key or network and prints only aggregate status', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-quota-health-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'quota.json');
+  const time = Date.now();
+  const snapshot = await runner([credential('private-account-name')], successful, time);
+  await writeFile(path, JSON.stringify(snapshot));
+  assert.equal((await readHealth(path, time)).status, 'healthy');
+  const invoke = () => spawnSync(process.execPath, [new URL('./snapshot.mjs', import.meta.url).pathname, '--health'], {
+    encoding: 'utf8', env: { ...process.env, CLAUDE_QUOTA_SNAPSHOT: path, CLIPROXY_MANAGEMENT_KEY_FILE: join(dir, 'absent-secret-key') },
+  });
+  let result = invoke();
+  assert.equal(result.status, 0);
+  assert.equal(JSON.parse(result.stdout).total, 1);
+  for (const value of ['private-account-name', syntheticFingerprint, 'absent-secret-key']) assert.equal((result.stdout + result.stderr).includes(value), false);
+  snapshot.accounts['private-account-name'].observed_at = new Date(time - 600_000).toISOString();
+  await writeFile(path, JSON.stringify(snapshot));
+  result = invoke();
+  assert.equal(result.status, 1);
+  assert.equal(JSON.parse(result.stdout).status, 'degraded');
+  await writeFile(path, 'synthetic-secret');
+  result = invoke();
+  assert.equal(result.status, 1);
+  assert.equal(JSON.parse(result.stderr).error, 'snapshot_unavailable');
+  assert.equal(result.stderr.includes('synthetic-secret'), false);
+});
+
+test('collector CLI publishes retry state before returning nonzero for a degraded collection', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-quota-cli-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'quota.json');
+  const keyPath = join(dir, 'key');
+  const setup = join(dir, 'mock.mjs');
+  await writeFile(keyPath, 'synthetic-secret');
+  await writeFile(setup, `globalThis.fetch = async url => url.endsWith('/quotas/claude/credentials')
+    ? Response.json({ files: [${JSON.stringify(credential('private-account-name'))}] })
+    : Response.json({ status_code: 200, body: 'synthetic-secret' });`);
+  const result = spawnSync(process.execPath, ['--import', setup, new URL('./snapshot.mjs', import.meta.url).pathname], {
+    encoding: 'utf8', env: { ...process.env, CLAUDE_QUOTA_SNAPSHOT: path, CLIPROXY_MANAGEMENT_KEY_FILE: keyPath },
+  });
+  assert.equal(result.status, 1);
+  const saved = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(saved.retry_state['private-account-name'].last_error, 'usage_parse');
+  assert.equal(JSON.parse(result.stdout).errors.usage_parse, 1);
+  for (const value of ['synthetic-secret', 'private-account-name', syntheticFingerprint]) assert.equal((result.stdout + result.stderr).includes(value), false);
+});
+
+test('installer reproducibly replaces maintained copies without changing quota state or keys', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-quota-install-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const invoke = () => spawnSync(process.execPath, [new URL('./install.mjs', import.meta.url).pathname, '--no-enable'], {
+    encoding: 'utf8', env: { ...process.env, HOME: dir },
+  });
+  let result = invoke();
+  assert.equal(result.status, 0, result.stderr);
+  const script = join(dir, '.local/share/cliproxyapi-quota/snapshot.mjs');
+  const quota = join(dir, '.local/share/cliproxyapi-quota/quota.json');
+  await writeFile(quota, 'synthetic-state');
+  await writeFile(script, 'obsolete collector');
+  result = invoke();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await readFile(script, 'utf8'), await readFile(new URL('./snapshot.mjs', import.meta.url), 'utf8'));
+  assert.equal(await readFile(quota, 'utf8'), 'synthetic-state');
+  for (const name of ['cliproxy-claude-quota.service', 'cliproxy-claude-quota.timer', 'cliproxy-claude-quota-health.service', 'cliproxy-claude-quota-health.timer']) {
+    const unit = await readFile(join(dir, '.config/systemd/user', name), 'utf8');
+    assert.equal(unit.includes('@NODE@'), false);
+    if (name.endsWith('.service')) assert.equal(unit.includes(process.execPath), true);
+    if (name.includes('-health.service')) {
+      assert.equal(unit.includes('--health'), true);
+      assert.equal(unit.includes('MANAGEMENT_KEY'), false);
+    }
+  }
 });

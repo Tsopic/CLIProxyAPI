@@ -53,3 +53,24 @@ func (handler *Handler) GetClaudeQuotaCredentials(request *gin.Context) {
 	request.Header("Cache-Control", "no-store")
 	request.JSON(http.StatusOK, gin.H{"files": files})
 }
+
+// GetClaudeQuotaHealth separates a failed collector from exhausted subscriptions.
+func (handler *Handler) GetClaudeQuotaHealth(request *gin.Context) {
+	handler.mu.Lock()
+	path := ""
+	if handler.cfg != nil {
+		path = handler.cfg.Routing.ClaudeQuotaSnapshot
+	}
+	handler.mu.Unlock()
+	var credentials []*coreauth.Auth
+	if handler.authManager != nil {
+		credentials = handler.authManager.List()
+	}
+	health := coreauth.ReadClaudeQuotaHealth(path, credentials, time.Now())
+	status := http.StatusOK
+	if health.Status != "healthy" {
+		status = http.StatusServiceUnavailable
+	}
+	request.Header("Cache-Control", "no-store")
+	request.JSON(status, health)
+}

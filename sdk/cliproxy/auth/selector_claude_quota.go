@@ -32,6 +32,7 @@ type claudeQuotaRetry struct {
 	AuthIndex             string    `json:"auth_index"`
 	CredentialFingerprint string    `json:"credential_fingerprint"`
 	NextAttemptAt         time.Time `json:"next_attempt_at"`
+	LastError             string    `json:"last_error,omitempty"`
 }
 
 type claudeQuotaSnapshot struct {
@@ -162,6 +163,7 @@ func (selector *ClaudeQuotaSelector) pick(ctx context.Context, provider, model s
 	var accountErr error
 	var earliestReset, earliestNextCheck time.Time
 	unknownReset := false
+	unavailableReason := "observation_unavailable"
 	weightSelector := fallback
 	if affinity, ok := sessionAffinitySelector(fallback); ok {
 		weightSelector = affinity.fallback
@@ -189,6 +191,11 @@ func (selector *ClaudeQuotaSelector) pick(ctx context.Context, provider, model s
 		}
 		if !known || data.Eligible == nil || !fresh || !bound || data.AuthIndex != "" && data.AuthIndex != candidate.Index {
 			accountErr = &Error{Code: "claude_quota_unavailable", Message: "Claude candidate quota is unknown", HTTPStatus: 503}
+			if retry := snap.RetryState[candidate.ID]; retry.AuthIndex == candidate.Index && retry.CredentialFingerprint == AccessTokenSHA256(candidate) && safeClaudeCollectorError(retry.LastError) != "" {
+				unavailableReason = "collector_refresh_failed"
+			} else if unavailableReason != "collector_refresh_failed" && known && bound && !fresh {
+				unavailableReason = "observation_stale"
+			}
 			continue
 		}
 		resolved := models[candidate.ID]
@@ -241,10 +248,20 @@ func (selector *ClaudeQuotaSelector) pick(ctx context.Context, provider, model s
 	}
 	if len(pool) == 0 {
 		if quotaErr != nil {
-			return nil, newClaudeQuotaError("claude_quota_unavailable", "Claude quota snapshot is missing, invalid, or stale", model, now, time.Time{}, earliestNextCheck)
+			err := newClaudeQuotaError("claude_quota_unavailable", "Claude quota snapshot is unavailable; check the quota collector", model, now, time.Time{}, earliestNextCheck)
+			err.Reason = "snapshot_unavailable"
+			return nil, err
 		}
 		if accountErr != nil {
-			return nil, newClaudeQuotaError("claude_quota_unavailable", "Claude candidate quota is unavailable or needs refreshing", model, now, time.Time{}, earliestNextCheck)
+			message := "Claude quota observations are unavailable; check the quota collector"
+			if unavailableReason == "collector_refresh_failed" {
+				message = "Claude quota refresh failed and cached observations are unavailable; check collector health"
+			} else if unavailableReason == "observation_stale" {
+				message = "Claude quota observations expired; check the quota collector"
+			}
+			err := newClaudeQuotaError("claude_quota_unavailable", message, model, now, time.Time{}, earliestNextCheck)
+			err.Reason = unavailableReason
+			return nil, err
 		}
 		if unknownReset {
 			earliestReset = time.Time{}

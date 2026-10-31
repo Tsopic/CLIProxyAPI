@@ -8,6 +8,9 @@ const sharedKeys = ['five_hour', 'seven_day', 'seven_day_oauth_apps'];
 const modelFamilies = ['opus', 'sonnet', 'fable', 'haiku', 'mythos'];
 const inactiveReset = '9999-12-31T23:59:59Z';
 const refreshMS = 5 * 60_000;
+const warningMS = 10 * 60_000;
+const staleMS = 30 * 60_000;
+const errorKinds = new Set(['transport', 'management_http', 'wrapper_parse', 'wrapper_schema', 'upstream_http', 'usage_parse', 'usage_schema']);
 const maxSourceBytes = 1024 * 1024;
 const record = value => value && typeof value === 'object' && !Array.isArray(value);
 const timestamp = value => typeof value === 'string' && value.length <= 64 && Number.isFinite(Date.parse(value));
@@ -15,6 +18,7 @@ const statusCode = value => Number.isInteger(value) && value >= 100 && value <= 
 const fingerprint = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 
 export function sanitizeUsage(input) {
+  input = sharedUsage(input);
   normalizeUsage(input);
   const result = {};
   const reset = value => value == null ? null : new Date(value).toISOString();
@@ -75,14 +79,16 @@ function previousState(source, time) {
     if (!record(entry) || typeof entry.auth_index !== 'string' || !entry.auth_index || !fingerprint(entry.credential_fingerprint) || !Number.isInteger(entry.failures) || entry.failures < 1 || entry.failures > 31 || !timestamp(entry.next_attempt_at)) continue;
     state.retry_state[id] = { auth_index: entry.auth_index, credential_fingerprint: entry.credential_fingerprint, failures: entry.failures, next_attempt_at: entry.next_attempt_at,
       ...(statusCode(entry.last_status) ? { last_status: entry.last_status } : {}),
-      ...(statusCode(entry.management_status) ? { management_status: entry.management_status } : {}) };
+      ...(statusCode(entry.management_status) ? { management_status: entry.management_status } : {}),
+      ...(errorKinds.has(entry.last_error) ? { last_error: entry.last_error } : {}),
+      ...(timestamp(entry.last_attempt_at) && Date.parse(entry.last_attempt_at) <= time ? { last_attempt_at: entry.last_attempt_at } : {}) };
   }
   if (timestamp(source.global_retry_at)) state.global_retry_at = source.global_retry_at;
   return state;
 }
 
 function validateWindow(window, label) {
-  if (!window || typeof window !== 'object' || typeof window.utilization !== 'number' || !Number.isFinite(window.utilization) || window.utilization < 0) throw new Error(`invalid ${label} utilization`);
+  if (!record(window) || typeof window.utilization !== 'number' || !Number.isFinite(window.utilization) || window.utilization < 0) throw new Error(`invalid ${label} utilization`);
   if (window.resets_at != null && (typeof window.resets_at !== 'string' || !Number.isFinite(Date.parse(window.resets_at)))) throw new Error(`invalid ${label} reset`);
   if (window.utilization > 0 && !window.resets_at) throw new Error(`missing ${label} reset`);
 }
@@ -97,8 +103,16 @@ function scopedFamily(scope) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+function sharedUsage(usage) {
+  if (!record(usage) || !Object.hasOwn(usage, 'five_hour') || !record(usage.seven_day)) throw new Error('missing shared quota windows');
+  // An explicitly inactive five-hour window is valid only alongside a valid weekly window.
+  validateWindow(usage.seven_day, 'seven_day');
+  return usage.five_hour === null ? { ...usage, five_hour: { utilization: 0, resets_at: null } } : usage;
+}
+
 export function normalizeUsage(usage) {
-  if (!usage || typeof usage !== 'object' || !usage.seven_day || !usage.five_hour) throw new Error('missing shared quota windows');
+  usage = sharedUsage(usage);
+  validateWindow(usage.five_hour, 'five_hour');
   let eligible = true;
   const blocked = new Set();
   for (const [key, window] of Object.entries(usage)) {
@@ -153,7 +167,7 @@ export async function collectSnapshot(base, key, fetcher = fetch, now = () => ne
     if (Date.parse(global_retry_at) > time) break;
     if (Date.parse(retry_state[account.id]?.next_attempt_at) > time || Date.parse(accounts[account.id]?.observed_at) + refreshMS > time) continue;
     const requestStart = new Date(time).toISOString();
-    let managementStatus, upstreamStatus, retryAfter = 0;
+    let managementStatus, upstreamStatus, retryAfter = 0, last_error = 'transport';
     try {
       const result = await fetcher(`${base}/${nativeAPI ? 'requests/api-call' : 'api-call'}`, {
         method: 'POST', headers, signal: AbortSignal.timeout(15000),
@@ -161,12 +175,22 @@ export async function collectSnapshot(base, key, fetcher = fetch, now = () => ne
       });
       managementStatus = result.status;
       retryAfter = retryAfterMS(Object.fromEntries(result.headers.entries()), now().getTime());
+      last_error = 'management_http';
       if (!result.ok) throw new Error(`quota request HTTP ${result.status}`);
+      last_error = 'wrapper_parse';
       const response = await result.json();
+      last_error = 'wrapper_schema';
+      if (!record(response) || !statusCode(response.status_code)) throw new Error('invalid quota wrapper');
       upstreamStatus = statusCode(response?.status_code) ? response.status_code : undefined;
       retryAfter = Math.max(retryAfter, retryAfterMS(response?.header, now().getTime()));
+      last_error = 'upstream_http';
       if (response.status_code !== 200) throw new Error(`quota upstream HTTP ${response.status_code}`);
-      const usage = sanitizeUsage(JSON.parse(response.body));
+      last_error = 'wrapper_schema';
+      if (typeof response.body !== 'string') throw new Error('invalid quota wrapper body');
+      last_error = 'usage_parse';
+      const parsed = JSON.parse(response.body);
+      last_error = 'usage_schema';
+      const usage = sanitizeUsage(parsed);
       accounts[account.id] = { ...normalizeUsage(usage), auth_index: account.auth_index, credential_fingerprint: account.credential_fingerprint, observed_at: requestStart, usage };
       delete retry_state[account.id];
     } catch {
@@ -174,13 +198,53 @@ export async function collectSnapshot(base, key, fetcher = fetch, now = () => ne
       const jitter = Math.max(0, Math.min(1, Number(random()) || 0));
       const delay = Math.max(retryAfter, Math.min(15 * 60_000, 60_000 * 2 ** (failures - 1) * (1 + jitter * 0.2)));
       const next_attempt_at = new Date(now().getTime() + delay).toISOString();
-      retry_state[account.id] = { auth_index: account.auth_index, credential_fingerprint: account.credential_fingerprint, failures, next_attempt_at,
+      retry_state[account.id] = { auth_index: account.auth_index, credential_fingerprint: account.credential_fingerprint, failures, next_attempt_at, last_error, last_attempt_at: requestStart,
         ...(statusCode(upstreamStatus) ? { last_status: upstreamStatus } : {}),
         ...(statusCode(managementStatus) ? { management_status: managementStatus } : {}) };
       if (upstreamStatus === 429 || managementStatus === 429) { global_retry_at = next_attempt_at; break; }
     }
   }
-  return { observed_at, accounts, retry_state, ...(global_retry_at ? { global_retry_at } : {}) };
+  const snapshot = { observed_at, accounts, retry_state, ...(global_retry_at ? { global_retry_at } : {}) };
+  const health = snapshotHealth(snapshot, now().getTime(), credentials.map(account => account.id));
+  return { ...snapshot, ...health };
+}
+
+// Recompute age on every read; published health alone cannot detect a stopped collector.
+export function snapshotHealth(snapshot, time = Date.now(), ids) {
+  if (!record(snapshot) || !record(snapshot.accounts) || !record(snapshot.retry_state) ||
+      !timestamp(snapshot.observed_at) || Date.parse(snapshot.observed_at) > time) throw new Error('invalid snapshot');
+  const prior = previousState(snapshot, time);
+  ids ??= [...new Set([...Object.keys(snapshot.accounts), ...Object.keys(snapshot.retry_state),
+    ...(record(snapshot.account_health) ? Object.keys(snapshot.account_health) : [])])];
+  const health = { status: 'healthy', checked_at: new Date(time).toISOString(), total: ids.length,
+    fresh: 0, warning: 0, stale: 0, missing: 0, failing: 0, backoff: 0, errors: {} };
+  const account_health = Object.create(null);
+  let oldest = time;
+  for (const id of ids) {
+    const observation = prior.accounts[id];
+    const retry = prior.retry_state[id];
+    const age = observation ? time - Date.parse(observation.observed_at) : Infinity;
+    const freshness = !observation ? 'missing' : age >= staleMS ? 'stale' : age >= warningMS ? 'warning' : 'fresh';
+    const backoff = Date.parse(prior.global_retry_at) > time || Date.parse(retry?.next_attempt_at) > time;
+    const status = freshness === 'missing' || freshness === 'stale' ? 'stale'
+      : retry || backoff || freshness === 'warning' ? 'degraded' : 'healthy';
+    health[freshness]++;
+    if (retry) health.failing++;
+    if (retry?.last_error) health.errors[retry.last_error] = (health.errors[retry.last_error] || 0) + 1;
+    if (backoff) health.backoff++;
+    if (observation) oldest = Math.min(oldest, Date.parse(observation.observed_at));
+    account_health[id] = { status, freshness, backoff,
+      ...(observation ? { last_success_at: observation.observed_at } : {}),
+      ...(retry?.last_attempt_at ? { last_attempt_at: retry.last_attempt_at } : {}),
+      ...(retry?.last_error ? { last_error: retry.last_error } : {}),
+      ...(backoff ? { next_attempt_at: new Date(Math.max(Date.parse(prior.global_retry_at) || 0, Date.parse(retry?.next_attempt_at) || 0)).toISOString() } : {}) };
+  }
+  if (health.total > health.missing) health.oldest_observation_at = new Date(oldest).toISOString();
+  const heartbeatAge = time - Date.parse(snapshot.observed_at);
+  health.collector_freshness = heartbeatAge >= staleMS ? 'stale' : heartbeatAge >= warningMS ? 'warning' : 'fresh';
+  health.status = health.stale || health.missing || heartbeatAge >= staleMS ? 'stale'
+    : !health.total || health.failing || health.backoff || health.warning || heartbeatAge >= warningMS ? 'degraded' : 'healthy';
+  return { health, account_health };
 }
 
 export async function publishSnapshot(path, snapshot) {
@@ -223,10 +287,33 @@ export async function collectAndPublish(path, base, key, { fetcher = fetch, now 
   }
 }
 
-async function main() {
-  const key = (await readFile(process.env.CLIPROXY_MANAGEMENT_KEY_FILE, 'utf8')).trim();
-  const snapshot = await collectAndPublish(process.env.CLAUDE_QUOTA_SNAPSHOT, 'http://127.0.0.1:8317/v8/management', key);
-  console.log(`Published Claude quota snapshot for ${Object.keys(snapshot.accounts).length} account(s)`);
+export async function readHealth(path, time = Date.now()) {
+  const source = await open(path, 'r');
+  try {
+    if ((await source.stat()).size > maxSourceBytes) throw new Error('snapshot too large');
+    const buffer = Buffer.alloc(maxSourceBytes + 1);
+    const { bytesRead } = await source.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > maxSourceBytes) throw new Error('snapshot too large');
+    return snapshotHealth(JSON.parse(buffer.subarray(0, bytesRead).toString('utf8')), time).health;
+  } finally { await source.close(); }
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main().catch(error => { console.error(error.message); process.exitCode = 1; });
+async function main() {
+  const path = process.env.CLAUDE_QUOTA_SNAPSHOT;
+  let health;
+  if (process.argv.includes('--health')) {
+    health = await readHealth(path);
+  } else {
+    const key = (await readFile(process.env.CLIPROXY_MANAGEMENT_KEY_FILE, 'utf8')).trim();
+    const snapshot = await collectAndPublish(path, 'http://127.0.0.1:8317/v8/management', key);
+    health = snapshot.health;
+  }
+  console.log(JSON.stringify(health));
+  if (health.status !== 'healthy') process.exitCode = 1;
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) main().catch(() => {
+  // Errors can contain response bodies, file paths, account names or credentials.
+  console.error(JSON.stringify({ status: 'stale', error: process.argv.includes('--health') ? 'snapshot_unavailable' : 'collection_failed' }));
+  process.exitCode = 1;
+});
