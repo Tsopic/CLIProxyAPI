@@ -7,14 +7,19 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 type ClaudeQuotaSelector struct {
 	SnapshotPath string
 	Fallback     Selector
+
+	// lastStaleWarnUnix rate-limits last-resort selection warnings.
+	lastStaleWarnUnix atomic.Int64
 }
 
 type claudeQuotaAccount struct {
@@ -90,17 +95,65 @@ func hasClaudeQuotaAuth(auths []*Auth) bool {
 	return false
 }
 
-func (manager *Manager) claudeQuotaContext(ctx context.Context, selector Selector, model string, auths []*Auth) context.Context {
+type claudeQuotaCoolingKey struct{}
+
+// claudeQuotaCoolingAuth is a Claude OAuth credential that the conductor
+// removed from the selector's candidates because it is temporarily blocked
+// (cooldown or transient unavailability) rather than permanently unusable.
+type claudeQuotaCoolingAuth struct {
+	auth  *Auth
+	until time.Time
+}
+
+func (manager *Manager) claudeQuotaContext(ctx context.Context, selector Selector, model string, auths []*Auth, cooling []claudeQuotaCoolingAuth) context.Context {
 	if _, ok := selector.(*ClaudeQuotaSelector); !ok {
 		return ctx
 	}
-	models := make(map[string]string, len(auths))
+	models := make(map[string]string, len(auths)+len(cooling))
 	for _, candidate := range auths {
 		if isClaudeQuotaAuth(candidate) {
 			models[candidate.ID] = manager.selectionModelForAuth(candidate, model)
 		}
 	}
-	return context.WithValue(ctx, claudeQuotaModelsKey{}, models)
+	for _, entry := range cooling {
+		if _, seen := models[entry.auth.ID]; !seen {
+			models[entry.auth.ID] = manager.selectionModelForAuth(entry.auth, model)
+		}
+	}
+	ctx = context.WithValue(ctx, claudeQuotaModelsKey{}, models)
+	if len(cooling) > 0 {
+		ctx = context.WithValue(ctx, claudeQuotaCoolingKey{}, cooling)
+	}
+	return ctx
+}
+
+// claudeQuotaCoolingAuths reports Claude OAuth candidates excluded from the
+// available set only because of a timed block. Callers must hold m.mu.
+func (manager *Manager) claudeQuotaCoolingAuths(selector Selector, candidates, available []*Auth, routeModel string, now time.Time) []claudeQuotaCoolingAuth {
+	if _, ok := selector.(*ClaudeQuotaSelector); !ok {
+		return nil
+	}
+	availableIDs := make(map[string]struct{}, len(available))
+	for _, candidate := range available {
+		if candidate != nil {
+			availableIDs[candidate.ID] = struct{}{}
+		}
+	}
+	var cooling []claudeQuotaCoolingAuth
+	for _, candidate := range candidates {
+		if !isClaudeQuotaAuth(candidate) {
+			continue
+		}
+		if _, ok := availableIDs[candidate.ID]; ok {
+			continue
+		}
+		blocked, reason, next := isAuthBlockedForModel(candidate, manager.selectionModelForAuth(candidate, routeModel), now)
+		if !blocked || reason == blockReasonDisabled || !next.After(now) || hasUnauthorizedAuthFailure(candidate) {
+			continue
+		}
+		cooling = append(cooling, claudeQuotaCoolingAuth{auth: candidate.Clone(), until: next})
+	}
+	return cooling
 }
 
 func (selector *ClaudeQuotaSelector) load(now time.Time) (claudeQuotaSnapshot, error) {
@@ -148,6 +201,126 @@ func (selector *ClaudeQuotaSelector) Pick(ctx context.Context, provider, model s
 	return selector.pick(ctx, provider, model, opts, auths, time.Now())
 }
 
+type claudeQuotaState int
+
+const (
+	// claudeQuotaStateUnknown means no fresh, bound observation exists.
+	claudeQuotaStateUnknown claudeQuotaState = iota
+	// claudeQuotaStateStaleEligible means the latest bound observation is
+	// stale but showed quota with a weekly reset still in the future.
+	claudeQuotaStateStaleEligible
+	// claudeQuotaStateRefresh means a fresh observation has expired windows.
+	claudeQuotaStateRefresh
+	// claudeQuotaStateBlocked means the account was observed without quota for the model.
+	claudeQuotaStateBlocked
+	// claudeQuotaStateEligible means a fresh, bound observation shows quota.
+	claudeQuotaStateEligible
+)
+
+type claudeQuotaVerdict struct {
+	state  claudeQuotaState
+	data   claudeQuotaAccount
+	reason string
+}
+
+// modelBlocked reports whether a blocked model family applies to model.
+// Unresolvable models are treated as blocked whenever any family is blocked.
+func (account claudeQuotaAccount) modelBlocked(model string) bool {
+	resolved := strings.ToLower(model)
+	knownFamily := false
+	for _, family := range claudeQuotaFamilies {
+		knownFamily = knownFamily || strings.Contains(resolved, family)
+	}
+	for _, family := range account.BlockedModelFamilies {
+		if strings.TrimSpace(family) == "" || !knownFamily || strings.Contains(resolved, strings.ToLower(family)) {
+			return true
+		}
+	}
+	return false
+}
+
+// evaluate classifies one Claude credential against the snapshot. Stale
+// eligibility is only granted to observations explicitly bound to the
+// credential's current auth index and access-token fingerprint.
+func (snapshot claudeQuotaSnapshot) evaluate(candidate *Auth, model string, now time.Time) claudeQuotaVerdict {
+	fingerprint := AccessTokenSHA256(candidate)
+	data, known := snapshot.Accounts[candidate.ID]
+	_, fresh := data.observation(snapshot, now)
+	legacy := data.ObservedAt.IsZero() && data.AuthIndex == "" && len(data.Usage) == 0 && data.CredentialFingerprint == ""
+	explicit := data.AuthIndex != "" && data.AuthIndex == candidate.Index && data.CredentialFingerprint != "" && data.CredentialFingerprint == fingerprint
+	bound := legacy || explicit
+	verdict := claudeQuotaVerdict{state: claudeQuotaStateUnknown, data: data, reason: "observation_unavailable"}
+	if !known || data.Eligible == nil || !fresh || !bound {
+		if retry := snapshot.RetryState[candidate.ID]; retry.AuthIndex == candidate.Index && retry.CredentialFingerprint == fingerprint && safeClaudeCollectorError(retry.LastError) != "" {
+			verdict.reason = "collector_refresh_failed"
+		} else if known && bound && !fresh {
+			verdict.reason = "observation_stale"
+		}
+		if known && explicit && !fresh && data.Eligible != nil && *data.Eligible && !data.ObservedAt.IsZero() && !data.ObservedAt.After(now) && data.WeeklyReset.After(now) && !data.modelBlocked(model) {
+			verdict.state = claudeQuotaStateStaleEligible
+		}
+		return verdict
+	}
+	verdict.reason = ""
+	if !*data.Eligible {
+		verdict.state = claudeQuotaStateBlocked
+		return verdict
+	}
+	if data.WeeklyReset.IsZero() || !data.WeeklyReset.After(now) || data.FiveHourReset.IsZero() || !data.FiveHourReset.After(now) {
+		verdict.state = claudeQuotaStateRefresh
+		return verdict
+	}
+	if data.modelBlocked(model) {
+		verdict.state = claudeQuotaStateBlocked
+		return verdict
+	}
+	verdict.state = claudeQuotaStateEligible
+	return verdict
+}
+
+// claudeQuotaPreferred orders accounts by earliest weekly reset, then earliest
+// five-hour reset, then ID.
+func claudeQuotaPreferred(candidate *Auth, data claudeQuotaAccount, best *Auth, bestData claudeQuotaAccount) bool {
+	if best == nil || data.WeeklyReset.Before(bestData.WeeklyReset) {
+		return true
+	}
+	if !data.WeeklyReset.Equal(bestData.WeeklyReset) {
+		return false
+	}
+	if data.FiveHourReset.Before(bestData.FiveHourReset) {
+		return true
+	}
+	return data.FiveHourReset.Equal(bestData.FiveHourReset) && candidate.ID < best.ID
+}
+
+// coolingEligibleUntil returns the earliest cooldown end among credentials that
+// the conductor excluded only temporarily but that still have quota in the
+// snapshot. Such a request is retryable soon and must not be reported as
+// quota exhaustion.
+func (snapshot claudeQuotaSnapshot) coolingEligibleUntil(ctx context.Context, model string, models map[string]string, weighted bool, now time.Time) (time.Time, bool) {
+	cooling, _ := ctx.Value(claudeQuotaCoolingKey{}).([]claudeQuotaCoolingAuth)
+	var earliest time.Time
+	for _, entry := range cooling {
+		if entry.auth == nil || !isClaudeQuotaAuth(entry.auth) || !entry.until.After(now) {
+			continue
+		}
+		if weighted && authWeight(entry.auth) <= 0 {
+			continue
+		}
+		resolved := models[entry.auth.ID]
+		if resolved == "" {
+			resolved = model
+		}
+		switch snapshot.evaluate(entry.auth, resolved, now).state {
+		case claudeQuotaStateEligible, claudeQuotaStateStaleEligible:
+			if earliest.IsZero() || entry.until.Before(earliest) {
+				earliest = entry.until
+			}
+		}
+	}
+	return earliest, !earliest.IsZero()
+}
+
 func (selector *ClaudeQuotaSelector) pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, now time.Time) (*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -170,8 +343,8 @@ func (selector *ClaudeQuotaSelector) pick(ctx context.Context, provider, model s
 	}
 	_, weighted := weightSelector.(*WeightedRoundRobinSelector)
 	models, _ := ctx.Value(claudeQuotaModelsKey{}).(map[string]string)
-	var best *Auth
-	var bestData claudeQuotaAccount
+	var best, stale *Auth
+	var bestData, staleData claudeQuotaAccount
 	for _, candidate := range auths {
 		if !isClaudeQuotaAuth(candidate) {
 			continue
@@ -183,58 +356,44 @@ func (selector *ClaudeQuotaSelector) pick(ctx context.Context, provider, model s
 		if earliestNextCheck.IsZero() || nextCheck.Before(earliestNextCheck) {
 			earliestNextCheck = nextCheck
 		}
-		data, known := snap.Accounts[candidate.ID]
-		_, fresh := data.observation(snap, now)
-		bound := data.ObservedAt.IsZero() && data.AuthIndex == "" && len(data.Usage) == 0 && data.CredentialFingerprint == ""
-		if !bound {
-			bound = data.AuthIndex != "" && data.AuthIndex == candidate.Index && data.CredentialFingerprint != "" && data.CredentialFingerprint == AccessTokenSHA256(candidate)
-		}
-		if !known || data.Eligible == nil || !fresh || !bound || data.AuthIndex != "" && data.AuthIndex != candidate.Index {
-			accountErr = &Error{Code: "claude_quota_unavailable", Message: "Claude candidate quota is unknown", HTTPStatus: 503}
-			if retry := snap.RetryState[candidate.ID]; retry.AuthIndex == candidate.Index && retry.CredentialFingerprint == AccessTokenSHA256(candidate) && safeClaudeCollectorError(retry.LastError) != "" {
-				unavailableReason = "collector_refresh_failed"
-			} else if unavailableReason != "collector_refresh_failed" && known && bound && !fresh {
-				unavailableReason = "observation_stale"
-			}
-			continue
-		}
 		resolved := models[candidate.ID]
 		if resolved == "" {
 			resolved = model
 		}
-		recordBlocked := func() {
-			reset := data.blockingReset(resolved, now)
+		verdict := snap.evaluate(candidate, resolved, now)
+		switch verdict.state {
+		case claudeQuotaStateUnknown, claudeQuotaStateStaleEligible:
+			accountErr = &Error{Code: "claude_quota_unavailable", Message: "Claude candidate quota is unknown", HTTPStatus: 503}
+			if verdict.reason == "collector_refresh_failed" {
+				unavailableReason = verdict.reason
+			} else if unavailableReason != "collector_refresh_failed" && verdict.reason == "observation_stale" {
+				unavailableReason = verdict.reason
+			}
+			if verdict.state == claudeQuotaStateStaleEligible && claudeQuotaPreferred(candidate, verdict.data, stale, staleData) {
+				stale, staleData = candidate, verdict.data
+			}
+		case claudeQuotaStateRefresh:
+			accountErr = &Error{Code: "claude_quota_unavailable", Message: "Claude quota windows need refreshing", HTTPStatus: 503}
+		case claudeQuotaStateBlocked:
+			reset := verdict.data.blockingReset(resolved, now)
 			if reset.IsZero() {
 				unknownReset = true
 			} else if earliestReset.IsZero() || reset.Before(earliestReset) {
 				earliestReset = reset
 			}
-		}
-		if !*data.Eligible {
-			recordBlocked()
-			continue
-		}
-		if data.WeeklyReset.IsZero() || !data.WeeklyReset.After(now) || data.FiveHourReset.IsZero() || !data.FiveHourReset.After(now) {
-			accountErr = &Error{Code: "claude_quota_unavailable", Message: "Claude quota windows need refreshing", HTTPStatus: 503}
-			continue
-		}
-		resolved = strings.ToLower(resolved)
-		blocked := false
-		knownFamily := false
-		for _, family := range []string{"opus", "sonnet", "haiku", "fable", "mythos"} {
-			knownFamily = knownFamily || strings.Contains(resolved, family)
-		}
-		for _, family := range data.BlockedModelFamilies {
-			if strings.TrimSpace(family) == "" || !knownFamily || strings.Contains(resolved, strings.ToLower(family)) {
-				blocked = true
+		case claudeQuotaStateEligible:
+			if claudeQuotaPreferred(candidate, verdict.data, best, bestData) {
+				best, bestData = candidate, verdict.data
 			}
 		}
-		if blocked {
-			recordBlocked()
-			continue
-		}
-		if best == nil || data.WeeklyReset.Before(bestData.WeeklyReset) || data.WeeklyReset.Equal(bestData.WeeklyReset) && (data.FiveHourReset.Before(bestData.FiveHourReset) || data.FiveHourReset.Equal(bestData.FiveHourReset) && candidate.ID < best.ID) {
-			best, bestData = candidate, data
+	}
+	// Fresh eligibility always wins. A stale-but-eligible observation is only
+	// a last resort so a stalled collector does not refuse every request.
+	chosen := best
+	if chosen == nil && stale != nil {
+		chosen = stale
+		if last := selector.lastStaleWarnUnix.Load(); now.Unix()-last >= 60 && selector.lastStaleWarnUnix.CompareAndSwap(last, now.Unix()) {
+			log.Warnf("claude quota: no fresh eligible account; using last-resort account %s observed at %s (weekly reset %s)", stale.ID, staleData.ObservedAt.UTC().Format(time.RFC3339), staleData.WeeklyReset.UTC().Format(time.RFC3339))
 		}
 	}
 	pool := make([]*Auth, 0, len(auths))
@@ -243,13 +402,18 @@ func (selector *ClaudeQuotaSelector) pick(ctx context.Context, provider, model s
 			pool = append(pool, candidate)
 		}
 	}
-	if quotaErr == nil && best != nil {
-		pool = append(pool, best)
+	if quotaErr == nil && chosen != nil {
+		pool = append(pool, chosen)
 	}
 	if len(pool) == 0 {
 		if quotaErr != nil {
 			err := newClaudeQuotaError("claude_quota_unavailable", "Claude quota snapshot is unavailable; check the quota collector", model, now, time.Time{}, earliestNextCheck)
 			err.Reason = "snapshot_unavailable"
+			return nil, err
+		}
+		if until, ok := snap.coolingEligibleUntil(ctx, model, models, weighted, now); ok {
+			err := newClaudeQuotaError("claude_quota_unavailable", "A Claude account with quota is temporarily cooling down after an upstream error; retry shortly", model, now, time.Time{}, until)
+			err.Reason = "eligible_account_cooling"
 			return nil, err
 		}
 		if accountErr != nil {
@@ -274,7 +438,7 @@ func (selector *ClaudeQuotaSelector) pick(ctx context.Context, provider, model s
 		return nil, errPick
 	}
 	if isClaudeQuotaAuth(selected) {
-		return best, nil
+		return chosen, nil
 	}
 	return selected, nil
 }

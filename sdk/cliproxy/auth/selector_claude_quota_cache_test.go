@@ -59,10 +59,19 @@ func TestClaudeQuotaPublicationCannotFreshenAccount(testContext *testing.T) {
 	account.ObservedAt = quotaTestNow.Add(-31 * time.Minute)
 	account.AuthIndex = candidate.Index
 	account.CredentialFingerprint = AccessTokenSHA256(candidate)
-	selector := &ClaudeQuotaSelector{SnapshotPath: quotaTestSnapshot(testContext, quotaTestNow, map[string]claudeQuotaAccount{"old": account})}
-	selected, err := selector.pick(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, []*Auth{candidate}, quotaTestNow)
-	if err == nil || selected != nil {
-		testContext.Fatalf("stale account selected=%v error=%v", selected, err)
+	// A fresh snapshot publication must not make the stale account fresh: a
+	// fresh competitor with a later weekly reset still wins.
+	fresh := quotaTestAccount(quotaTestNow, 24*time.Hour, time.Hour)
+	selector := &ClaudeQuotaSelector{SnapshotPath: quotaTestSnapshot(testContext, quotaTestNow, map[string]claudeQuotaAccount{"old": account, "fresh": fresh})}
+	selected, err := selector.pick(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, []*Auth{candidate, quotaTestAuth("fresh", "claude")}, quotaTestNow)
+	if err != nil || selected == nil || selected.ID != "fresh" {
+		testContext.Fatalf("stale account treated as fresh: selected=%v error=%v", selected, err)
+	}
+	// Alone, the stale-but-eligible bound account is only a last resort.
+	selector = &ClaudeQuotaSelector{SnapshotPath: quotaTestSnapshot(testContext, quotaTestNow, map[string]claudeQuotaAccount{"old": account})}
+	selected, err = selector.pick(context.Background(), "claude", "claude-opus-5-5", cliproxyexecutor.Options{}, []*Auth{candidate}, quotaTestNow)
+	if err != nil || selected == nil || selected.ID != "old" {
+		testContext.Fatalf("stale last resort selected=%v error=%v", selected, err)
 	}
 }
 

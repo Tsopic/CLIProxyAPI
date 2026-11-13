@@ -1972,6 +1972,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAvailable)
 		return nil, nil, errAvailable
 	}
+	claudeCooling := m.claudeQuotaCoolingAuths(selector, candidates, available, model, now)
 	transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(selector, affinityCandidates, model, now)
 	m.mu.RUnlock()
 
@@ -1985,7 +1986,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	if !handled {
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
-		selectorCtx = m.claudeQuotaContext(selectorCtx, selector, model, selectorAuths)
+		selectorCtx = m.claudeQuotaContext(selectorCtx, selector, model, selectorAuths, claudeCooling)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
 		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
@@ -2325,6 +2326,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAvailable)
 		return nil, nil, "", errAvailable
 	}
+	claudeCooling := m.claudeQuotaCoolingAuths(selector, candidates, available, model, now)
 	transientAuthIDs := m.transientlyUnavailableSessionAffinityAuthIDs(selector, affinityCandidates, model, now)
 	m.mu.RUnlock()
 
@@ -2338,7 +2340,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	if !handled {
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
-		selectorCtx = m.claudeQuotaContext(selectorCtx, selector, model, selectorAuths)
+		selectorCtx = m.claudeQuotaContext(selectorCtx, selector, model, selectorAuths, claudeCooling)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
 		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
