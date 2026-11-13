@@ -38,6 +38,7 @@ func (w *Watcher) scheduleConfigReload() {
 		w.configReloadMu.Lock()
 		w.configReloadTimer = nil
 		w.configReloadMu.Unlock()
+		w.rewatchConfigFile()
 		w.reloadConfigIfChanged()
 	})
 }

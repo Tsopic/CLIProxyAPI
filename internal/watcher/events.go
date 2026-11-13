@@ -32,6 +32,15 @@ func (w *Watcher) start(ctx context.Context) error {
 		return errAddConfig
 	}
 	log.Debugf("watching config file: %s", w.configPath)
+	// Editors and tools such as `sed -i` replace the config by renaming a new
+	// file over it. That drops the inotify watch on the old inode, so also
+	// watch the parent directory and match events by name.
+	configDir := filepath.Dir(w.configPath)
+	if errAddConfigDir := w.watcher.Add(configDir); errAddConfigDir != nil {
+		log.Warnf("failed to watch config directory %s: %v; atomic config replacement may not trigger reloads", configDir, errAddConfigDir)
+	} else {
+		log.Debugf("watching config directory: %s", configDir)
+	}
 
 	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
 		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
@@ -66,7 +75,10 @@ func (w *Watcher) processEvents(ctx context.Context) {
 
 func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Filter only relevant events: config file or auth-dir JSON files.
-	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
+	// Remove and Chmod are included because an atomic replace of a symlinked
+	// config's target surfaces only as Chmod (link-count change) on the
+	// watched path before the kernel silently drops the watch.
+	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename | fsnotify.Remove | fsnotify.Chmod
 	normalizedName := w.normalizeAuthPath(event.Name)
 	normalizedConfigPath := w.normalizeAuthPath(w.configPath)
 	normalizedAuthDir := w.normalizeAuthPath(w.authDir)
@@ -140,6 +152,24 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		}
 		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
 		w.addOrUpdateClientLocked(event.Name)
+	}
+}
+
+// rewatchConfigFile re-establishes the direct watch on the config path after
+// it was replaced or removed. It runs from the debounced reload, after the
+// watcher has processed the old inode's removal. The direct watch follows a
+// symlinked config to its target, which the parent-directory watch cannot
+// observe. A missing file is not an error: the directory watch reports its
+// reappearance. Adding an existing watch is idempotent.
+func (w *Watcher) rewatchConfigFile() {
+	if w == nil || w.watcher == nil {
+		return
+	}
+	if _, errStat := os.Stat(w.configPath); errStat != nil {
+		return
+	}
+	if errAdd := w.watcher.Add(w.configPath); errAdd != nil {
+		log.Debugf("failed to re-watch config file %s: %v", w.configPath, errAdd)
 	}
 }
 
